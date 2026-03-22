@@ -22,10 +22,17 @@ from pathlib import Path
 import numpy as np
 import sentencepiece as spm
 import torch
+import wandb
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+GRAD_ACC_DIV = 1
+if torch.cuda.get_device_name() == "NVIDIA GeForce RTX 3090":
+    torch._inductor.config.max_fusion_size = 4
+    GRAD_ACC_DIV = 2
+
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -52,13 +59,19 @@ class Hyperparameters:
     train_log_every = int(os.environ.get('TRAIN_LOG_EVERY', 200))
 
     # Training length.
-    iterations = int(os.environ.get('ITERATIONS', 20000))
+
+    times = int(os.environ.get('TIMES', 1))
+    iterations = int(os.environ.get('ITERATIONS', 20000 / times))
     warmdown_iters = int(os.environ.get('WARMDOWN_ITERS', 1200))
     warmup_steps = int(os.environ.get('WARMUP_STEPS', 20))
-    train_batch_tokens = int(os.environ.get('TRAIN_BATCH_TOKENS', 524_288))
+    train_batch_tokens = int(os.environ.get('TRAIN_BATCH_TOKENS', times * 524_288))
     train_seq_len = int(os.environ.get('TRAIN_SEQ_LEN', 1024))
     max_wallclock_seconds = float(os.environ.get('MAX_WALLCLOCK_SECONDS', 600.0))
     qk_gain_init = float(os.environ.get('QK_GAIN_INIT', 1.5))
+
+    # Weights & Biases.
+    wandb_project = os.environ.get('WANDB_PROJECT', 'minimind')
+    wandb_enabled = bool(int(os.environ.get('WANDB_ENABLED', '1')))
 
     # Model shape.
     vocab_size = int(os.environ.get('VOCAB_SIZE', 1024))
@@ -750,7 +763,7 @@ def main() -> None:
         raise ValueError(f'WORLD_SIZE must be positive, got {world_size}')
     if 8 % world_size != 0:
         raise ValueError(f'WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral')
-    grad_accum_steps = 8 // world_size
+    grad_accum_steps = 8 // world_size // GRAD_ACC_DIV
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA is required')
@@ -800,6 +813,9 @@ def main() -> None:
         console=False,
     )
     log0('=' * 100, console=False)
+
+    if master_process and args.wandb_enabled:
+        wandb.init(project=args.wandb_project, name=args.run_id, config=vars(args), save_code=False)
 
     # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -993,6 +1009,8 @@ def main() -> None:
                 f'step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} '
                 f'train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms'
             )
+            if master_process and args.wandb_enabled:
+                wandb.log({'step': step, 'val_loss': val_loss, 'val_bpb': val_bpb, 'train_time_ms': training_time_ms}, step=step)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1038,6 +1056,8 @@ def main() -> None:
                 f'step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} '
                 f'train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms'
             )
+            if master_process and args.wandb_enabled:
+                wandb.log({'step': step, 'train_loss': train_loss.item()}, step=step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1108,6 +1128,9 @@ def main() -> None:
     torch.cuda.synchronize()
     log0(f'final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms')
     log0(f'final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}')
+
+    if master_process and args.wandb_enabled:
+        wandb.finish()
 
     if distributed:
         dist.destroy_process_group()
