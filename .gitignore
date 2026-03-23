@@ -1,4 +1,5 @@
 # Project specific
+final_model*
 wandb/
 data/tokenizers
 __pycache__/

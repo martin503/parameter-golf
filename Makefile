@@ -22,5 +22,4 @@ train: ## Run training (single GPU)
 	uv run python train_gpt.py
 
 train-rtx: ## Run distributed training (2x3090)
-	uv run torchrun --standalone --nproc_per_node=2 train_gpt.py
-
+	MAX_WALLCLOCK_SECONDS=12000 uv run torchrun --standalone --nproc_per_node=2 train_gpt.py

@@ -22,11 +22,12 @@ from pathlib import Path
 import numpy as np
 import sentencepiece as spm
 import torch
-import wandb
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+import wandb
 
 GRAD_ACC_DIV = 1
 if torch.cuda.get_device_name() == "NVIDIA GeForce RTX 3090":
@@ -53,13 +54,16 @@ class Hyperparameters:
     run_id = os.environ.get('RUN_ID', str(uuid.uuid4()))
     seed = int(os.environ.get('SEED', 1337))
 
+    # Weights & Biases.
+    wandb_project = os.environ.get('WANDB_PROJECT', 'minimind')
+    wandb_enabled = bool(int(os.environ.get('WANDB_ENABLED', '1')))
+
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get('VAL_BATCH_SIZE', 524_288))
     val_loss_every = int(os.environ.get('VAL_LOSS_EVERY', 1000))
     train_log_every = int(os.environ.get('TRAIN_LOG_EVERY', 200))
 
     # Training length.
-
     times = int(os.environ.get('TIMES', 1))
     iterations = int(os.environ.get('ITERATIONS', 20000 / times))
     warmdown_iters = int(os.environ.get('WARMDOWN_ITERS', 1200))
@@ -68,10 +72,6 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get('TRAIN_SEQ_LEN', 1024))
     max_wallclock_seconds = float(os.environ.get('MAX_WALLCLOCK_SECONDS', 600.0))
     qk_gain_init = float(os.environ.get('QK_GAIN_INIT', 1.5))
-
-    # Weights & Biases.
-    wandb_project = os.environ.get('WANDB_PROJECT', 'minimind')
-    wandb_enabled = bool(int(os.environ.get('WANDB_ENABLED', '1')))
 
     # Model shape.
     vocab_size = int(os.environ.get('VOCAB_SIZE', 1024))
