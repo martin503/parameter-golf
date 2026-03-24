@@ -1057,7 +1057,7 @@ def main() -> None:
                 f'train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms'
             )
             if master_process and args.wandb_enabled:
-                wandb.log({'step': step, 'train_loss': train_loss.item()}, step=step)
+                wandb.log({'step': step, 'train_loss': train_loss.item(), 'lr_mul': scale}, step=step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms

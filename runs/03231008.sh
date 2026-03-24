@@ -1,0 +1,1 @@
+MAX_WALLCLOCK_SECONDS=12000 WARMDOWN_ITERS=4000 uv run torchrun --standalone --nproc_per_node=2 train_gpt.py
