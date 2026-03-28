@@ -1,0 +1,8 @@
+#!/bin/bash
+set +e
+
+MODEL_BASENAME=models/03260655_8l MAX_WALLCLOCK_SECONDS=12000 WARMDOWN_ITERS=4000 NUM_LAYERS=8 TRAIN_BATCH_TOKENS=655360 uv run torchrun --standalone --nproc_per_node=2 train_gpt.py
+
+MODEL_BASENAME=models/03260655_7l MAX_WALLCLOCK_SECONDS=12000 WARMDOWN_ITERS=4000 NUM_LAYERS=7 TRAIN_BATCH_TOKENS=720896 uv run torchrun --standalone --nproc_per_node=2 train_gpt.py
+
+MODEL_BASENAME=models/03260655_6l MAX_WALLCLOCK_SECONDS=12000 WARMDOWN_ITERS=4000 NUM_LAYERS=6 TRAIN_BATCH_TOKENS=835584 uv run torchrun --standalone --nproc_per_node=2 train_gpt.py

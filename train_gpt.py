@@ -27,6 +27,14 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+import wandb
+
+GRAD_ACC_DIV = 1
+if torch.cuda.get_device_name() == "NVIDIA GeForce RTX 3090":
+    torch._inductor.config.max_fusion_size = 2
+    GRAD_ACC_DIV = 1
+
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -44,6 +52,9 @@ class Hyperparameters:
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
+
+    # Model output basename (without extension)
+    model_basename = os.environ.get('MODEL_BASENAME', 'final_model')
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
@@ -87,9 +98,9 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
-# MUON OPTIMIZER 
+# MUON OPTIMIZER
 # -----------------------------
-# 
+#
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
@@ -169,7 +180,7 @@ class Muon(torch.optim.Optimizer):
 
 
 # -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
+# TOKENIZER-AGNOSTIC EVALUATION SETUP
 # -----------------------------
 #
 # It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
@@ -423,7 +434,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
-# DATA LOADING 
+# DATA LOADING
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -1066,12 +1077,13 @@ def main() -> None:
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
-        model_bytes = os.path.getsize("final_model.pt")
-        code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model: {model_bytes} bytes")
-        log0(f"Code size: {code_bytes} bytes")
-        log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        model_pt_path = f'{args.model_basename}.pt'
+        torch.save(base_model.state_dict(), model_pt_path)
+        model_bytes = os.path.getsize(model_pt_path)
+        code_bytes = len(code.encode('utf-8'))
+        log0(f'Serialized model: {model_bytes} bytes')
+        log0(f'Code size: {code_bytes} bytes')
+        log0(f'Total submission size: {model_bytes + code_bytes} bytes')
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
@@ -1080,11 +1092,12 @@ def main() -> None:
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        model_ptz_path = f'{args.model_basename}.int8.ptz'
+        with open(model_ptz_path, 'wb') as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
-        code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        quant_file_bytes = os.path.getsize(model_ptz_path)
+        code_bytes = len(code.encode('utf-8'))
+        ratio = quant_stats['baseline_tensor_bytes'] / max(quant_stats['int8_payload_bytes'], 1)
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
@@ -1093,7 +1106,8 @@ def main() -> None:
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    model_ptz_path = f'{args.model_basename}.int8.ptz'
+    with open(model_ptz_path, 'rb') as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
