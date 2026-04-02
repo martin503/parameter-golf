@@ -115,8 +115,7 @@ class Hyperparameters:
     solar_layer_pattern = os.environ.get("SOLAR_LAYER_PATTERN", "")
     solar_warmup = int(os.environ.get("SOLAR_WARMUP", "50"))
     solar_warmdown = int(os.environ.get("SOLAR_WARMDOWN", "500"))
-    solar_lr_mul_orig = float(os.environ.get("SOLAR_LR_MUL_ORIG", "1.0"))
-    solar_lr_mul_dup = float(os.environ.get("SOLAR_LR_MUL_DUP", "1.0"))
+    solar_lr_mul = float(os.environ.get("SOLAR_LR_MUL", "1.0"))
     solar_resume_path = os.environ.get("SOLAR_RESUME_PATH", "")
     solar_dup_type = os.environ.get("SOLAR_DUP_TYPE", "dec")
 
@@ -170,6 +169,57 @@ def parse_layer_pattern(
 
     return enc_indices + dec_indices
 
+
+def extract_optimizer_states_for_dus(
+    base_model: GPT, optimizers: list
+) -> dict:
+    param_to_key: dict[int, tuple] = {}
+    for layer_idx, block in enumerate(base_model.blocks):
+        for name, p in block.named_parameters():
+            param_to_key[id(p)] = ("block", layer_idx, name)
+    param_to_key[id(base_model.tok_emb.weight)] = ("tok_emb",)
+    if base_model.lm_head is not None:
+        param_to_key[id(base_model.lm_head.weight)] = ("lm_head",)
+    if base_model.num_skip_weights > 0:
+        param_to_key[id(base_model.skip_weights)] = ("skip_weights",)
+    states: dict[tuple, dict] = {}
+    for opt in optimizers:
+        for group in opt.param_groups:
+            for p in group["params"]:
+                if id(p) in param_to_key and p in opt.state:
+                    key = param_to_key[id(p)]
+                    states[key] = {
+                        k: v.detach().cpu().clone() if isinstance(v, Tensor) else v
+                        for k, v in opt.state[p].items()
+                    }
+    return states
+
+
+def inject_optimizer_states_for_dus(
+    new_optimizers: list, base_model: GPT, layer_pattern: list[int],
+    saved_states: dict, device: torch.device
+) -> None:
+    param_to_key: dict[int, tuple] = {}
+    for pos in range(len(layer_pattern)):
+        for name, p in base_model.blocks[pos].named_parameters():
+            param_to_key[id(p)] = ("block", layer_pattern[pos], name)
+    param_to_key[id(base_model.tok_emb.weight)] = ("tok_emb",)
+    if base_model.lm_head is not None:
+        param_to_key[id(base_model.lm_head.weight)] = ("lm_head",)
+    if base_model.num_skip_weights > 0:
+        param_to_key[id(base_model.skip_weights)] = ("skip_weights",)
+    for opt in new_optimizers:
+        for group in opt.param_groups:
+            for p in group["params"]:
+                if id(p) in param_to_key:
+                    key = param_to_key[id(p)]
+                    if key in saved_states:
+                        opt.state[p] = {
+                            k: v.to(device=device, dtype=p.dtype) if isinstance(v, Tensor) else v
+                            for k, v in saved_states[key].items()
+                        }
+
+
 def load_solar_checkpoint(path: str, device: torch.device) -> dict | None:
     """Load SOLAR checkpoint with model state, optimizer states, and dataloader state."""
     try:
@@ -179,6 +229,7 @@ def load_solar_checkpoint(path: str, device: torch.device) -> dict | None:
             "optimizer_states": checkpoint.get("optimizer_states", []),
             "dataloader_state": checkpoint.get("dataloader_state", None),
             "hyperparameters": checkpoint.get("hyperparameters", {}),
+            "optimizer_states_by_layer": checkpoint.get("optimizer_states_by_layer", None),
         }
     except Exception as e:
         print(f"Warning: Failed to load SOLAR checkpoint from {path}: {e}")
@@ -1035,60 +1086,31 @@ def apply_dus_model(
     return wrapped_model
 
 
-def create_stage2_optimizers(
+def create_solar_optimizers(
     base_model: GPT,
-    pattern: list[int],
-    lr_mul_orig: float,
-    lr_mul_dup: float,
     args: Hyperparameters,
+    lr_mul: float = 1.0,
 ) -> list:
-    """
-    Create optimizers with different LR multipliers for original vs duplicated layers.
-
-    Args:
-        base_model: Original GPT model (not wrapped)
-        pattern: Layer index pattern (0-indexed)
-        lr_mul_orig: LR multiplier for original (first occurrence) layers
-        lr_mul_dup: LR multiplier for duplicated layers
-        args: Hyperparameters
-
-    Returns:
-        List of optimizers
-    """
-    # Track which layer indices appear multiple times
-    layer_occurrences = {}
-    for pos, layer_idx in enumerate(pattern):
-        if layer_idx not in layer_occurrences:
-            layer_occurrences[layer_idx] = []
-        layer_occurrences[layer_idx].append(pos)
-
-    # Separate params by original/duplicated
-    orig_matrix_params = []
-    dup_matrix_params = []
-    orig_scalar_params = []
-    dup_scalar_params = []
-
-    for pos, layer_idx in enumerate(pattern):
-        block = base_model.blocks[layer_idx]
-        occurrences = layer_occurrences[layer_idx]
-        is_first = pos == occurrences[0]
-
-        for name, p in block.named_parameters():
-            if p.ndim == 2:  # matrix
-                (orig_matrix_params if is_first else dup_matrix_params).append(p)
-            else:  # scalar/vector
-                (orig_scalar_params if is_first else dup_scalar_params).append(p)
-
-    # Add skip_weights to scalar params if present
+    block_named_params = list(base_model.blocks.named_parameters())
+    matrix_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim == 2
+        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    scalar_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim < 2
+        or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
     if base_model.num_skip_weights > 0 and base_model.skip_weights.numel() > 0:
-        orig_scalar_params.append(base_model.skip_weights)
-
-    # Create param groups with different LRs
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    token_lr *= lr_mul
 
     optimizers = []
 
-    # Token embedding optimizer
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -1097,75 +1119,35 @@ def create_stage2_optimizers(
     )
     optimizers.append(optimizer_tok)
 
-    # LM head optimizer if not tied
     if not args.tie_embeddings and base_model.lm_head is not None:
+        head_lr = args.head_lr * lr_mul
         optimizer_head = torch.optim.Adam(
-            [
-                {
-                    "params": [base_model.lm_head.weight],
-                    "lr": args.head_lr,
-                    "base_lr": args.head_lr,
-                }
-            ],
+            [{"params": [base_model.lm_head.weight], "lr": head_lr, "base_lr": head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
         )
         optimizers.append(optimizer_head)
 
-    # Muon optimizers for matrix params
-    if orig_matrix_params:
-        optimizer_muon_orig = Muon(
-            orig_matrix_params,
-            lr=args.matrix_lr * lr_mul_orig,
-            momentum=args.muon_momentum,
-            backend_steps=args.muon_backend_steps,
-        )
-        for group in optimizer_muon_orig.param_groups:
-            group["base_lr"] = args.matrix_lr * lr_mul_orig
-        optimizers.append(optimizer_muon_orig)
+    matrix_lr = args.matrix_lr * lr_mul
+    optimizer_muon = Muon(
+        matrix_params,
+        lr=matrix_lr,
+        momentum=args.muon_momentum,
+        backend_steps=args.muon_backend_steps,
+    )
+    for group in optimizer_muon.param_groups:
+        group["base_lr"] = matrix_lr
+    optimizers.append(optimizer_muon)
 
-    if dup_matrix_params:
-        optimizer_muon_dup = Muon(
-            dup_matrix_params,
-            lr=args.matrix_lr * lr_mul_dup,
-            momentum=args.muon_momentum,
-            backend_steps=args.muon_backend_steps,
-        )
-        for group in optimizer_muon_dup.param_groups:
-            group["base_lr"] = args.matrix_lr * lr_mul_dup
-        optimizers.append(optimizer_muon_dup)
-
-    # Adam optimizers for scalar params
-    if orig_scalar_params:
-        optimizer_scalar_orig = torch.optim.Adam(
-            [
-                {
-                    "params": orig_scalar_params,
-                    "lr": args.scalar_lr * lr_mul_orig,
-                    "base_lr": args.scalar_lr * lr_mul_orig,
-                }
-            ],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.append(optimizer_scalar_orig)
-
-    if dup_scalar_params:
-        optimizer_scalar_dup = torch.optim.Adam(
-            [
-                {
-                    "params": dup_scalar_params,
-                    "lr": args.scalar_lr * lr_mul_dup,
-                    "base_lr": args.scalar_lr * lr_mul_dup,
-                }
-            ],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.append(optimizer_scalar_dup)
+    scalar_lr = args.scalar_lr * lr_mul
+    optimizer_scalar = torch.optim.Adam(
+        [{"params": scalar_params, "lr": scalar_lr, "base_lr": scalar_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+    optimizers.append(optimizer_scalar)
 
     return optimizers
 
@@ -1174,13 +1156,12 @@ def solar_stage2_transition(
     base_model: GPT,
     pattern: list[int],
     dup_type: str,
-    lr_mul_orig: float,
-    lr_mul_dup: float,
     args: Hyperparameters,
     device: torch.device,
     train_loader,
     step: int,
     training_time_ms: float,
+    saved_opt_states: dict | None = None,
 ) -> tuple:
     """
     Handle transition from stage 1 to stage 2 of SOLAR DUS.
@@ -1208,6 +1189,7 @@ def solar_stage2_transition(
             "num_kv_heads": args.num_kv_heads,
             "mlp_mult": args.mlp_mult,
         },
+        "optimizer_states_by_layer": saved_opt_states,
     }
     checkpoint_path = f"{args.model_basename}_solar_stage1.pt"
     torch.save(solar_checkpoint, checkpoint_path)
@@ -1223,9 +1205,15 @@ def solar_stage2_transition(
     compiled_model = torch.compile(new_model, dynamic=False, fullgraph=True)
 
     # Create stage 2 optimizers (optimizes the base_model's parameters directly)
-    new_optimizers = create_stage2_optimizers(
-        base_model, pattern, lr_mul_orig, lr_mul_dup, args
+    new_optimizers = create_solar_optimizers(
+        base_model, args, lr_mul=args.solar_lr_mul
     )
+
+    if saved_opt_states is not None:
+        inject_optimizer_states_for_dus(
+            new_optimizers, base_model, pattern, saved_opt_states, device
+        )
+        print(f"[SOLAR] Injected optimizer states for {len(saved_opt_states)} param groups")
 
     # Reset train loader (start from beginning for stage 2)
     new_train_loader = DistributedTokenLoader(
@@ -1405,13 +1393,14 @@ def main() -> None:
         )
         base_model.load_state_dict(ckpt["model_state"])
 
-        # For logging - define token_lr (stage 2 uses different LR setup)
-        token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-
         # Apply DUS wrapper (returns wrapped model, not a new GPT)
         wrapped_model = apply_dus_model(
             base_model, solar_pattern, device, args.solar_dup_type
         ).to(device).bfloat16()
+        for module in base_model.modules():
+            if isinstance(module, CastedLinear):
+                module.float()
+        restore_low_dim_params_to_fp32(base_model)
         compiled_model = torch.compile(wrapped_model, dynamic=False, fullgraph=True)
         model: nn.Module = (
             DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
@@ -1420,13 +1409,15 @@ def main() -> None:
         )
 
         # Create stage 2 optimizers (optimizes base_model parameters directly)
-        optimizers = create_stage2_optimizers(
-            base_model,
-            solar_pattern,
-            args.solar_lr_mul_orig,
-            args.solar_lr_mul_dup,
-            args,
+        optimizers = create_solar_optimizers(
+            base_model, args, lr_mul=args.solar_lr_mul
         )
+        saved_opt_states = ckpt.get("optimizer_states_by_layer")
+        if saved_opt_states:
+            inject_optimizer_states_for_dus(
+                optimizers, base_model, solar_pattern, saved_opt_states, device
+            )
+            print(f"[SOLAR] Restored optimizer states for {len(saved_opt_states)} param groups")
     else:
         # Normal training or SOLAR stage 1
         base_model = (
@@ -1457,78 +1448,7 @@ def main() -> None:
             else compiled_model
         )
 
-        # Optimizer split:
-        # - token embedding (Adam) uses EMBED_LR
-        # - untied lm_head (Adam) uses HEAD_LR
-        # - matrix params in transformer blocks use MATRIX_LR via Muon
-        # - vectors/scalars use SCALAR_LR via Adam
-        block_named_params = list(base_model.blocks.named_parameters())
-        matrix_params = [
-            p
-            for name, p in block_named_params
-            if p.ndim == 2
-            and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        ]
-        scalar_params = [
-            p
-            for name, p in block_named_params
-            if p.ndim < 2
-            or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        ]
-        if base_model.skip_weights.numel() > 0:
-            scalar_params.append(base_model.skip_weights)
-        token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-        optimizer_tok = torch.optim.Adam(
-            [
-                {
-                    "params": [base_model.tok_emb.weight],
-                    "lr": token_lr,
-                    "base_lr": token_lr,
-                }
-            ],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizer_muon = Muon(
-            matrix_params,
-            lr=args.matrix_lr,
-            momentum=args.muon_momentum,
-            backend_steps=args.muon_backend_steps,
-        )
-        for group in optimizer_muon.param_groups:
-            group["base_lr"] = args.matrix_lr
-        optimizer_scalar = torch.optim.Adam(
-            [
-                {
-                    "params": scalar_params,
-                    "lr": args.scalar_lr,
-                    "base_lr": args.scalar_lr,
-                }
-            ],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers: list[torch.optim.Optimizer] = [
-            optimizer_tok,
-            optimizer_muon,
-            optimizer_scalar,
-        ]
-        if base_model.lm_head is not None:
-            optimizer_head = torch.optim.Adam(
-                [
-                    {
-                        "params": [base_model.lm_head.weight],
-                        "lr": args.head_lr,
-                        "base_lr": args.head_lr,
-                    }
-                ],
-                betas=(args.beta1, args.beta2),
-                eps=args.adam_eps,
-                fused=True,
-            )
-            optimizers.insert(1, optimizer_head)
+        optimizers = create_solar_optimizers(base_model, args)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1537,6 +1457,7 @@ def main() -> None:
     log0(
         f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}"
     )
+    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1760,6 +1681,7 @@ def main() -> None:
                 log0(
                     f"[SOLAR] CUDA memory before cleanup: {torch.cuda.memory_allocated() / 1e9:.2f}GB"
                 )
+                saved_opt_states = extract_optimizer_states_for_dus(base_model, optimizers)
                 if distributed and isinstance(model, DDP):
                     model = model.module  # Unwrap DDP before deleting
                 del model
@@ -1788,13 +1710,12 @@ def main() -> None:
                         base_model,
                         solar_pattern,
                         args.solar_dup_type,
-                        args.solar_lr_mul_orig,
-                        args.solar_lr_mul_dup,
                         args,
                         device,
                         train_loader,
                         step,
                         training_time_ms,
+                        saved_opt_states=saved_opt_states,
                     )
                 )
 
@@ -1932,6 +1853,7 @@ def main() -> None:
                     "num_kv_heads": args.num_kv_heads,
                     "mlp_mult": args.mlp_mult,
                 },
+                "optimizer_states_by_layer": extract_optimizer_states_for_dus(base_model, optimizers),
             }
             torch.save(save_dict, model_pt_path)
 
