@@ -147,7 +147,7 @@ def parse_layer_pattern(
     Examples with n_layers=8 (4 enc + 4 dec), pattern="1,2,3,3,4":
     - dup_type="full": enc uses [0,1,1,2,3], dec uses [4,5,6,6,7]
       → full: [0,1,1,2,3, 4,5,6,6,7]
-      
+
     Examples with n_layers=4 (2 enc + 2 dec), pattern="1,2,2":
     - dup_type!="full": enc uses [0,1], dec uses [2,3,3]
       → full: [0,1, 2,3,3]
@@ -945,12 +945,12 @@ class GPTWithSOLARDUS(torch.nn.Module):
         self.layer_pattern = layer_pattern
         self.dup_type = dup_type
         self.num_total_layers = len(layer_pattern)
-        self.num_og_layers = self.base_model.num_enc_layers + self.base_model.num_dec_layers
-        self.num_encoder_layers = sum([i < self.num_total_layers // 2 for i in self.layer_pattern])
+        self.num_og_layers = self.base_model.num_encoder_layers + self.base_model.num_decoder_layers
+        self.num_encoder_layers = sum(x < self.base_model.num_encoder_layers for x in self.layer_pattern) if self.dup_type == "full" else self.base_model.num_encoder_layers
         self.dec_to_enc_idx = self._build_enc_mapping()
-        self.base_model.skip_weights = self.base_model.skip_weights[torch.tensor([x for x in self.dec_to_enc_idx if x is not None])]
+        self.base_model.skip_weights = nn.Parameter(self.base_model.skip_weights[torch.tensor([x for x in self.dec_to_enc_idx if x is not None])])
         self.base_model.blocks = nn.ModuleList([copy.deepcopy(self.base_model.blocks[i]) for i in self.layer_pattern])
-        
+
     def _build_enc_mapping(self) -> list[int]:
         """
         Build mapping from decoder position to enc index.
@@ -967,13 +967,13 @@ class GPTWithSOLARDUS(torch.nn.Module):
                     cenc -= 1
                     mapping[i] = cenc
             return mapping
-        
+
         n_skip = self.base_model.num_skip_weights
-        dec_pattern_relative = [x - self.num_encoder_layers for x in self.layer_pattern]
+        dec_pattern_relative = [x - self.num_encoder_layers for x in self.layer_pattern[n_skip:]]
         mapping = []
         for ir in dec_pattern_relative:
-            enc_idx = self.num_encoder_layers - ir
-            if ir > n_skip:
+            enc_idx = self.num_encoder_layers - ir - 1
+            if ir == n_skip:
                 mapping.append(None)
             elif enc_idx not in mapping:
                 mapping.append(enc_idx)
@@ -1003,7 +1003,7 @@ class GPTWithSOLARDUS(torch.nn.Module):
 
         x = self.base_model.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
-        if self.tie_embeddings:
+        if self.base_model.tie_embeddings:
             logits_proj = F.linear(x, self.base_model.tok_emb.weight)
         else:
             if self.lm_head is None:
@@ -1384,7 +1384,7 @@ def main() -> None:
 
     if solar_stage2:
         # SOLAR Stage 2: Load checkpoint and apply DUS wrapper immediately
-        ckpt = load_solar_checkpoint(args.solar_resume_path, device)
+        ckpt = load_solar_checkpoint(args.solar_resume_path, "cpu")
 
         # Create base model from checkpoint config
         ckpt_hyp = ckpt["hyperparameters"]
@@ -1402,8 +1402,6 @@ def main() -> None:
                 rope_base=args.rope_base,
                 qk_gain_init=args.qk_gain_init,
             )
-            .to(device)
-            .bfloat16()
         )
         base_model.load_state_dict(ckpt["model_state"])
 
@@ -1413,7 +1411,7 @@ def main() -> None:
         # Apply DUS wrapper (returns wrapped model, not a new GPT)
         wrapped_model = apply_dus_model(
             base_model, solar_pattern, device, args.solar_dup_type
-        )
+        ).to(device).bfloat16()
         compiled_model = torch.compile(wrapped_model, dynamic=False, fullgraph=True)
         model: nn.Module = (
             DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
