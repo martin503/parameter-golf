@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import copy
 import glob
-import io
 import math
 import os
 import random
@@ -16,7 +15,6 @@ import subprocess
 import sys
 import time
 import uuid
-import zlib
 from pathlib import Path
 from collections import defaultdict
 
@@ -68,6 +66,7 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    checkpoint_every_val = bool(int(os.environ.get("CHECKPOINT_EVERY_VAL", "0")))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -447,14 +446,6 @@ def eval_val(
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
-# -----------------------------
-# POST-TRAINING QUANTIZATION
-# -----------------------------
-#
-# It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
-
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
@@ -463,167 +454,6 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
-INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get(
-        "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
-        ",".join(CONTROL_TENSOR_NAME_PATTERNS),
-    ).split(",")
-    if pattern
-)
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
-INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
-INT8_PER_ROW_SCALE_DTYPE = torch.float16
-INT8_CLIP_PERCENTILE = 99.99984
-INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-
-
-def tensor_nbytes(t: Tensor) -> int:
-    return int(t.numel()) * int(t.element_size())
-
-
-def keep_float_tensor(
-    name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]
-) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
-        return t.float().contiguous()
-    if t.dtype in {torch.float32, torch.bfloat16}:
-        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
-        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
-    return t
-
-
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
-    t32 = t.float()
-    if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(
-            torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None]
-        )
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = (
-            torch.clamp(torch.round(clipped / scale[:, None]), -127, 127)
-            .to(torch.int8)
-            .contiguous()
-        )
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-
-    # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = (
-        float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item())
-        if t32.numel()
-        else 0.0
-    )
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = (
-        torch.clamp(
-            torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127
-        )
-        .to(torch.int8)
-        .contiguous()
-    )
-    return q, scale
-
-
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
-    # - per-tensor int8 for other float tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
-    quantized: dict[str, Tensor] = {}
-    scales: dict[str, Tensor] = {}
-    dtypes: dict[str, str] = {}
-    passthrough: dict[str, Tensor] = {}
-    passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
-    stats = dict.fromkeys(
-        (
-            "param_count",
-            "num_tensors",
-            "num_float_tensors",
-            "num_nonfloat_tensors",
-            "baseline_tensor_bytes",
-            "int8_payload_bytes",
-        ),
-        0,
-    )
-
-    for name, tensor in state_dict.items():
-        t = tensor.detach().to("cpu").contiguous()
-        stats["param_count"] += int(t.numel())
-        stats["num_tensors"] += 1
-        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
-
-        if not t.is_floating_point():
-            stats["num_nonfloat_tensors"] += 1
-            passthrough[name] = t
-            stats["int8_payload_bytes"] += tensor_nbytes(t)
-            continue
-
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
-            passthrough[name] = kept
-            stats["int8_payload_bytes"] += tensor_nbytes(kept)
-            continue
-
-        stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q
-        scales[name] = s
-        dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
-
-    obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
-        "quantized": quantized,
-        "scales": scales,
-        "dtypes": dtypes,
-        "passthrough": passthrough,
-    }
-    if qmeta:
-        obj["qmeta"] = qmeta
-    if passthrough_orig_dtypes:
-        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
-    return obj, stats
-
-
-def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
-    out: dict[str, Tensor] = {}
-    qmeta = obj.get("qmeta", {})
-    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
-    for name, q in obj["quantized"].items():
-        dtype = getattr(torch, obj["dtypes"][name])
-        s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
-            s = s.to(dtype=torch.float32)
-            # Broadcast the saved row scale back across trailing dimensions.
-            out[name] = (
-                (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1))))
-                .to(dtype=dtype)
-                .contiguous()
-            )
-        else:
-            scale = float(s.item())
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
-    for name, t in obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
-        out_t = t.detach().to("cpu").contiguous()
-        orig_dtype = passthrough_orig_dtypes.get(name)
-        if isinstance(orig_dtype, str):
-            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
-        out[name] = out_t
-    return out
 
 
 # -----------------------------
@@ -999,7 +829,10 @@ class GPTWithSOLARDUS(torch.nn.Module):
         self.num_og_layers = self.base_model.num_encoder_layers + self.base_model.num_decoder_layers
         self.num_encoder_layers = sum(x < self.base_model.num_encoder_layers for x in self.layer_pattern) if self.dup_type == "full" else self.base_model.num_encoder_layers
         self.dec_to_enc_idx = self._build_enc_mapping()
-        self.base_model.skip_weights = nn.Parameter(self.base_model.skip_weights[torch.tensor([x for x in self.dec_to_enc_idx if x is not None])])
+        if self.dup_type == "full":
+            self.base_model.skip_weights = nn.Parameter(self.base_model.skip_weights[torch.tensor([x for x in self.layer_pattern[:self.num_encoder_layers] if x is not None])])
+        else:
+            self.base_model.skip_weights = nn.Parameter(self.base_model.skip_weights[torch.tensor([x for x in self.dec_to_enc_idx if x is not None])])
         self.base_model.blocks = nn.ModuleList([copy.deepcopy(self.base_model.blocks[i]) for i in self.layer_pattern])
 
     def _build_enc_mapping(self) -> list[int]:
@@ -1019,12 +852,11 @@ class GPTWithSOLARDUS(torch.nn.Module):
                     mapping[i] = cenc
             return mapping
 
-        n_skip = self.base_model.num_skip_weights
-        dec_pattern_relative = [x - self.num_encoder_layers for x in self.layer_pattern[n_skip:]]
+        decoder_pattern_relative = [x - self.num_encoder_layers for x in self.layer_pattern[self.base_model.num_skip_weights:]]
         mapping = []
-        for ir in dec_pattern_relative:
+        for ir in decoder_pattern_relative:
             enc_idx = self.num_encoder_layers - ir - 1
-            if ir == n_skip:
+            if ir == self.base_model.num_skip_weights:
                 mapping.append(None)
             elif enc_idx not in mapping:
                 mapping.append(enc_idx)
@@ -1038,18 +870,21 @@ class GPTWithSOLARDUS(torch.nn.Module):
         x = self.base_model.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        skips = defaultdict(list)
+        skips = []
 
         for i in range(self.num_encoder_layers):
             x = self.base_model.blocks[i](x, x0)
-            skips[self.layer_pattern[i]].append(x)
+            skips.append(x)
+        nnones = 0
         for i in range(self.num_total_layers - self.num_encoder_layers):
             if self.dec_to_enc_idx[i] is not None:
                 x = (
                     x
-                    + self.base_model.skip_weights[self.dec_to_enc_idx[i]].to(dtype=x.dtype)[None, None, :]
-                    * skips[self.layer_pattern[self.dec_to_enc_idx[i]]].pop()
+                    + self.base_model.skip_weights[i - nnones].to(dtype=x.dtype)[None, None, :]
+                    * skips[self.dec_to_enc_idx[i]]
                 )
+            else:
+                nnones += 1
             x = self.base_model.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.base_model.final_norm(x).reshape(-1, x.size(-1))
@@ -1616,6 +1451,28 @@ def main() -> None:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
+            if master_process and args.checkpoint_every_val and not last_step:
+                ckpt_path = f"{args.model_basename}_step{step}.pt"
+                save_dict = {
+                    "model": base_model.state_dict(),
+                    "dataloader_state": {
+                        "file_idx": train_loader.stream.file_idx,
+                        "pos": train_loader.stream.pos,
+                        "step": step,
+                    },
+                    "hyperparameters": {
+                        "vocab_size": args.vocab_size,
+                        "num_layers": args.num_layers,
+                        "model_dim": args.model_dim,
+                        "num_heads": args.num_heads,
+                        "num_kv_heads": args.num_kv_heads,
+                        "mlp_mult": args.mlp_mult,
+                    },
+                    "optimizer_states_by_layer": extract_optimizer_states_for_dus(base_model, optimizers),
+                }
+                torch.save(save_dict, ckpt_path)
+                log0(f"saved checkpoint: {ckpt_path}")
+
         if last_step:
             if stop_after_step is not None and step < args.iterations:
                 stage_str = "[SOLAR Stage 2] " if solar_stage2 else ""
@@ -1815,19 +1672,12 @@ def main() -> None:
     )
 
     # -----------------------------
-    # SERIALIZATION + ROUNDTRIP VALIDATION
+    # SERIALIZATION
     # -----------------------------
-    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
-        # Determine model to save based on whether SOLAR stage 2 was run
         if args.solar_enabled and (solar_transition_done or solar_stage2):
-            # SOLAR stage 2: save wrapped model with metadata
-            model_to_save = model  # This is the wrapped GPTWithSOLARDUS
             model_pt_path = f"{args.model_basename}_stage2.pt"
-
-            # Save with metadata for loading
             save_dict = {
                 "model_type": "SOLAR_DUS",
                 "layer_pattern": solar_pattern,
@@ -1836,7 +1686,6 @@ def main() -> None:
             }
             torch.save(save_dict, model_pt_path)
         else:
-            # Normal training or SOLAR stage 1: save base model with dataloader state for SOLAR resume
             model_pt_path = f"{args.model_basename}_stage1.pt"
             save_dict = {
                 "model": base_model.state_dict(),
@@ -1862,66 +1711,6 @@ def main() -> None:
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
-
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_raw_bytes = len(quant_raw)
-    if master_process:
-        if args.solar_enabled and (solar_transition_done or solar_stage2):
-            model_ptz_path = f"{args.model_basename}_stage2.int8.ptz"
-        else:
-            model_ptz_path = f"{args.model_basename}_stage1.int8.ptz"
-        with open(model_ptz_path, "wb") as f:
-            f.write(quant_blob)
-        quant_file_bytes = os.path.getsize(model_ptz_path)
-        code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(
-            quant_stats["int8_payload_bytes"], 1
-        )
-        log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
-        )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
-
-    if distributed:
-        dist.barrier()
-    # Determine ptz path (all ranks need this for roundtrip validation)
-    if args.solar_enabled and (solar_transition_done or solar_stage2):
-        model_ptz_path = f"{args.model_basename}_stage2.int8.ptz"
-    else:
-        model_ptz_path = f"{args.model_basename}_stage1.int8.ptz"
-    with open(model_ptz_path, "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(
-        io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu"
-    )
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(
-        f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}"
-    )
 
     if master_process and args.wandb_enabled:
         wandb.finish()
