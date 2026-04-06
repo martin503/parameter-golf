@@ -162,16 +162,16 @@ def parse_layer_pattern(
     dec_indices = [i + n_layers // 2 for i in zero_indexed]
     if dup_type == "full":
         stop_enc_idx = n_layers // 2
-        enc_indices = [stop_enc_idx - i - 1 for i in zero_indexed if i < stop_enc_idx][::-1]
+        enc_indices = [stop_enc_idx - i - 1 for i in zero_indexed if i < stop_enc_idx][
+            ::-1
+        ]
     else:
         enc_indices = [i for i in range(n_layers // 2) if i in zero_indexed]
 
     return enc_indices + dec_indices
 
 
-def extract_optimizer_states_for_dus(
-    base_model: GPT, optimizers: list
-) -> dict:
+def extract_optimizer_states_for_dus(base_model: GPT, optimizers: list) -> dict:
     param_to_key: dict[int, tuple] = {}
     for layer_idx, block in enumerate(base_model.blocks):
         for name, p in block.named_parameters():
@@ -194,9 +194,39 @@ def extract_optimizer_states_for_dus(
     return states
 
 
+def _get_skip_weights_src_indices(
+    layer_pattern: list[int],
+    num_encoder_layers: int,
+    num_skip_weights: int,
+    dup_type: str,
+) -> list[int] | None:
+    if dup_type == "full":
+        dus_enc_count = sum(x < num_encoder_layers for x in layer_pattern)
+        return [x for x in layer_pattern[:dus_enc_count] if x is not None]
+    dec_to_enc_idx: list[int | None] = []
+    decoder_pattern_relative = [
+        x - num_encoder_layers for x in layer_pattern[num_skip_weights:]
+    ]
+    for ir in decoder_pattern_relative:
+        enc_idx = num_encoder_layers - ir - 1
+        if ir == num_skip_weights:
+            dec_to_enc_idx.append(None)
+        elif enc_idx not in dec_to_enc_idx:
+            dec_to_enc_idx.append(enc_idx)
+        elif dup_type == "dec":
+            dec_to_enc_idx.append(None)
+        else:
+            dec_to_enc_idx.append(enc_idx)
+    return [x for x in dec_to_enc_idx if x is not None]
+
+
 def inject_optimizer_states_for_dus(
-    new_optimizers: list, base_model: GPT, layer_pattern: list[int],
-    saved_states: dict, device: torch.device
+    new_optimizers: list,
+    base_model: GPT,
+    layer_pattern: list[int],
+    saved_states: dict,
+    device: torch.device,
+    dup_type: str = "full",
 ) -> None:
     param_to_key: dict[int, tuple] = {}
     for pos in range(len(layer_pattern)):
@@ -207,16 +237,56 @@ def inject_optimizer_states_for_dus(
         param_to_key[id(base_model.lm_head.weight)] = ("lm_head",)
     if base_model.num_skip_weights > 0:
         param_to_key[id(base_model.skip_weights)] = ("skip_weights",)
+
+    skip_src_indices = _get_skip_weights_src_indices(
+        layer_pattern,
+        base_model.num_encoder_layers,
+        base_model.num_skip_weights,
+        dup_type,
+    )
+
     for opt in new_optimizers:
         for group in opt.param_groups:
             for p in group["params"]:
                 if id(p) in param_to_key:
                     key = param_to_key[id(p)]
                     if key in saved_states:
-                        opt.state[p] = {
-                            k: v.to(device=device, dtype=p.dtype) if isinstance(v, Tensor) else v
-                            for k, v in saved_states[key].items()
-                        }
+                        saved_state = saved_states[key]
+                        if (
+                            key == ("skip_weights",)
+                            and skip_src_indices is not None
+                            and saved_state.get("exp_avg") is not None
+                        ):
+                            exp_avg = saved_state["exp_avg"].to(
+                                device=device, dtype=p.dtype
+                            )
+                            exp_avg_sq = saved_state["exp_avg_sq"].to(
+                                device=device, dtype=p.dtype
+                            )
+                            if exp_avg.shape != p.shape:
+                                new_exp_avg = exp_avg[skip_src_indices]
+                                new_exp_avg_sq = exp_avg_sq[skip_src_indices]
+                                opt.state[p] = {
+                                    k: v
+                                    for k, v in saved_state.items()
+                                    if not isinstance(v, Tensor)
+                                }
+                                opt.state[p]["exp_avg"] = new_exp_avg
+                                opt.state[p]["exp_avg_sq"] = new_exp_avg_sq
+                            else:
+                                opt.state[p] = {
+                                    k: v.to(device=device, dtype=p.dtype)
+                                    if isinstance(v, Tensor)
+                                    else v
+                                    for k, v in saved_state.items()
+                                }
+                        else:
+                            opt.state[p] = {
+                                k: v.to(device=device, dtype=p.dtype)
+                                if isinstance(v, Tensor)
+                                else v
+                                for k, v in saved_state.items()
+                            }
 
 
 def load_solar_checkpoint(path: str, device: torch.device) -> dict | None:
@@ -228,7 +298,9 @@ def load_solar_checkpoint(path: str, device: torch.device) -> dict | None:
             "optimizer_states": checkpoint.get("optimizer_states", []),
             "dataloader_state": checkpoint.get("dataloader_state", None),
             "hyperparameters": checkpoint.get("hyperparameters", {}),
-            "optimizer_states_by_layer": checkpoint.get("optimizer_states_by_layer", None),
+            "optimizer_states_by_layer": checkpoint.get(
+                "optimizer_states_by_layer", None
+            ),
         }
     except Exception as e:
         print(f"Warning: Failed to load SOLAR checkpoint from {path}: {e}")
@@ -826,14 +898,36 @@ class GPTWithSOLARDUS(torch.nn.Module):
         self.layer_pattern = layer_pattern
         self.dup_type = dup_type
         self.num_total_layers = len(layer_pattern)
-        self.num_og_layers = self.base_model.num_encoder_layers + self.base_model.num_decoder_layers
-        self.num_encoder_layers = sum(x < self.base_model.num_encoder_layers for x in self.layer_pattern) if self.dup_type == "full" else self.base_model.num_encoder_layers
+        self.num_og_layers = (
+            self.base_model.num_encoder_layers + self.base_model.num_decoder_layers
+        )
+        self.num_encoder_layers = (
+            sum(x < self.base_model.num_encoder_layers for x in self.layer_pattern)
+            if self.dup_type == "full"
+            else self.base_model.num_encoder_layers
+        )
         self.dec_to_enc_idx = self._build_enc_mapping()
         if self.dup_type == "full":
-            self.base_model.skip_weights = nn.Parameter(self.base_model.skip_weights[torch.tensor([x for x in self.layer_pattern[:self.num_encoder_layers] if x is not None])])
+            self.base_model.skip_weights = nn.Parameter(
+                self.base_model.skip_weights[
+                    torch.tensor(
+                        [
+                            x
+                            for x in self.layer_pattern[: self.num_encoder_layers]
+                            if x is not None
+                        ]
+                    )
+                ]
+            )
         else:
-            self.base_model.skip_weights = nn.Parameter(self.base_model.skip_weights[torch.tensor([x for x in self.dec_to_enc_idx if x is not None])])
-        self.base_model.blocks = nn.ModuleList([copy.deepcopy(self.base_model.blocks[i]) for i in self.layer_pattern])
+            self.base_model.skip_weights = nn.Parameter(
+                self.base_model.skip_weights[
+                    torch.tensor([x for x in self.dec_to_enc_idx if x is not None])
+                ]
+            )
+        self.base_model.blocks = nn.ModuleList(
+            [copy.deepcopy(self.base_model.blocks[i]) for i in self.layer_pattern]
+        )
 
     def _build_enc_mapping(self) -> list[int]:
         """
@@ -845,14 +939,21 @@ class GPTWithSOLARDUS(torch.nn.Module):
             mapping = num_dec_layers * [-1]
             cenc = self.num_encoder_layers
             for i in range(num_dec_layers):
-                if self.num_og_layers % 2 == 1 and self.layer_pattern[self.num_encoder_layers + i] == self.num_og_layers - 1:
+                if (
+                    self.num_og_layers % 2 == 1
+                    and self.layer_pattern[self.num_encoder_layers + i]
+                    == self.num_og_layers - 1
+                ):
                     mapping[i] = None
                 else:
                     cenc -= 1
                     mapping[i] = cenc
             return mapping
 
-        decoder_pattern_relative = [x - self.num_encoder_layers for x in self.layer_pattern[self.base_model.num_skip_weights:]]
+        decoder_pattern_relative = [
+            x - self.num_encoder_layers
+            for x in self.layer_pattern[self.base_model.num_skip_weights :]
+        ]
         mapping = []
         for ir in decoder_pattern_relative:
             enc_idx = self.num_encoder_layers - ir - 1
@@ -880,7 +981,9 @@ class GPTWithSOLARDUS(torch.nn.Module):
             if self.dec_to_enc_idx[i] is not None:
                 x = (
                     x
-                    + self.base_model.skip_weights[i - nnones].to(dtype=x.dtype)[None, None, :]
+                    + self.base_model.skip_weights[i - nnones].to(dtype=x.dtype)[
+                        None, None, :
+                    ]
                     * skips[self.dec_to_enc_idx[i]]
                 )
             else:
@@ -895,7 +998,9 @@ class GPTWithSOLARDUS(torch.nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.base_model.lm_head(x)
-        logits = self.base_model.logit_softcap * torch.tanh(logits_proj / self.base_model.logit_softcap)
+        logits = self.base_model.logit_softcap * torch.tanh(
+            logits_proj / self.base_model.logit_softcap
+        )
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -957,7 +1062,13 @@ def create_solar_optimizers(
     if not args.tie_embeddings and base_model.lm_head is not None:
         head_lr = args.head_lr * lr_mul
         optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": head_lr, "base_lr": head_lr}],
+            [
+                {
+                    "params": [base_model.lm_head.weight],
+                    "lr": head_lr,
+                    "base_lr": head_lr,
+                }
+            ],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
@@ -1040,15 +1151,20 @@ def solar_stage2_transition(
     compiled_model = torch.compile(new_model, dynamic=False, fullgraph=True)
 
     # Create stage 2 optimizers (optimizes the base_model's parameters directly)
-    new_optimizers = create_solar_optimizers(
-        base_model, args, lr_mul=args.solar_lr_mul
-    )
+    new_optimizers = create_solar_optimizers(base_model, args, lr_mul=args.solar_lr_mul)
 
     if saved_opt_states is not None:
         inject_optimizer_states_for_dus(
-            new_optimizers, base_model, pattern, saved_opt_states, device
+            new_optimizers,
+            base_model,
+            pattern,
+            saved_opt_states,
+            device,
+            dup_type=dup_type,
         )
-        print(f"[SOLAR] Injected optimizer states for {len(saved_opt_states)} param groups")
+        print(
+            f"[SOLAR] Injected optimizer states for {len(saved_opt_states)} param groups"
+        )
 
     # Reset train loader (start from beginning for stage 2)
     new_train_loader = DistributedTokenLoader(
@@ -1211,27 +1327,27 @@ def main() -> None:
 
         # Create base model from checkpoint config
         ckpt_hyp = ckpt["hyperparameters"]
-        base_model = (
-            GPT(
-                vocab_size=ckpt_hyp.get("vocab_size", args.vocab_size),
-                num_layers=ckpt_hyp.get("num_layers", args.num_layers),
-                model_dim=ckpt_hyp.get("model_dim", args.model_dim),
-                num_heads=ckpt_hyp.get("num_heads", args.num_heads),
-                num_kv_heads=ckpt_hyp.get("num_kv_heads", args.num_kv_heads),
-                mlp_mult=ckpt_hyp.get("mlp_mult", args.mlp_mult),
-                tie_embeddings=args.tie_embeddings,
-                tied_embed_init_std=args.tied_embed_init_std,
-                logit_softcap=args.logit_softcap,
-                rope_base=args.rope_base,
-                qk_gain_init=args.qk_gain_init,
-            )
+        base_model = GPT(
+            vocab_size=ckpt_hyp.get("vocab_size", args.vocab_size),
+            num_layers=ckpt_hyp.get("num_layers", args.num_layers),
+            model_dim=ckpt_hyp.get("model_dim", args.model_dim),
+            num_heads=ckpt_hyp.get("num_heads", args.num_heads),
+            num_kv_heads=ckpt_hyp.get("num_kv_heads", args.num_kv_heads),
+            mlp_mult=ckpt_hyp.get("mlp_mult", args.mlp_mult),
+            tie_embeddings=args.tie_embeddings,
+            tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
         )
         base_model.load_state_dict(ckpt["model_state"])
 
         # Apply DUS wrapper (returns wrapped model, not a new GPT)
-        wrapped_model = apply_dus_model(
-            base_model, solar_pattern, device, args.solar_dup_type
-        ).to(device).bfloat16()
+        wrapped_model = (
+            apply_dus_model(base_model, solar_pattern, device, args.solar_dup_type)
+            .to(device)
+            .bfloat16()
+        )
         for module in base_model.modules():
             if isinstance(module, CastedLinear):
                 module.float()
@@ -1244,15 +1360,20 @@ def main() -> None:
         )
 
         # Create stage 2 optimizers (optimizes base_model parameters directly)
-        optimizers = create_solar_optimizers(
-            base_model, args, lr_mul=args.solar_lr_mul
-        )
+        optimizers = create_solar_optimizers(base_model, args, lr_mul=args.solar_lr_mul)
         saved_opt_states = ckpt.get("optimizer_states_by_layer")
         if saved_opt_states:
             inject_optimizer_states_for_dus(
-                optimizers, base_model, solar_pattern, saved_opt_states, device
+                optimizers,
+                base_model,
+                solar_pattern,
+                saved_opt_states,
+                device,
+                dup_type=args.solar_dup_type,
             )
-            print(f"[SOLAR] Restored optimizer states for {len(saved_opt_states)} param groups")
+            print(
+                f"[SOLAR] Restored optimizer states for {len(saved_opt_states)} param groups"
+            )
     else:
         # Normal training or SOLAR stage 1
         base_model = (
@@ -1468,7 +1589,9 @@ def main() -> None:
                         "num_kv_heads": args.num_kv_heads,
                         "mlp_mult": args.mlp_mult,
                     },
-                    "optimizer_states_by_layer": extract_optimizer_states_for_dus(base_model, optimizers),
+                    "optimizer_states_by_layer": extract_optimizer_states_for_dus(
+                        base_model, optimizers
+                    ),
                 }
                 torch.save(save_dict, ckpt_path)
                 log0(f"saved checkpoint: {ckpt_path}")
@@ -1538,7 +1661,9 @@ def main() -> None:
                 log0(
                     f"[SOLAR] CUDA memory before cleanup: {torch.cuda.memory_allocated() / 1e9:.2f}GB"
                 )
-                saved_opt_states = extract_optimizer_states_for_dus(base_model, optimizers)
+                saved_opt_states = extract_optimizer_states_for_dus(
+                    base_model, optimizers
+                )
                 if distributed and isinstance(model, DDP):
                     model = model.module  # Unwrap DDP before deleting
                 del model
@@ -1702,7 +1827,9 @@ def main() -> None:
                     "num_kv_heads": args.num_kv_heads,
                     "mlp_mult": args.mlp_mult,
                 },
-                "optimizer_states_by_layer": extract_optimizer_states_for_dus(base_model, optimizers),
+                "optimizer_states_by_layer": extract_optimizer_states_for_dus(
+                    base_model, optimizers
+                ),
             }
             torch.save(save_dict, model_pt_path)
 
