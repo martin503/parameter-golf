@@ -139,16 +139,14 @@ def parse_layer_pattern(
     - "tie": pattern applies to decoder only, encoder unchanged
 
     Examples with n_layers=7 (3 enc + 4 dec), pattern="1,2,3,3,4":
-    - dup_type="full": enc uses [0,0,1,2] (4 skipped), dec uses [3,4,5,5,6] (all used)
-      → full: [0,0,1,2, 3,4,5,5,6]
+      → full: [0,0,1,2, 3,4,5,5,6], skip map: 0→7,1→6,2→5,3→4
+      → tie: [0,1,2, 3,4,5,5,6], skip map: 0→6,0→5,1→4,2→3
+      → dec: [0,1,2, 3,4,5,5,6], skip map: 0→5,1→4,2→3
 
     Examples with n_layers=8 (4 enc + 4 dec), pattern="1,2,3,3,4":
-    - dup_type="full": enc uses [0,1,1,2,3], dec uses [4,5,6,6,7]
-      → full: [0,1,1,2,3, 4,5,6,6,7]
-
-    Examples with n_layers=4 (2 enc + 2 dec), pattern="1,2,2":
-    - dup_type!="full": enc uses [0,1], dec uses [2,3,3]
-      → full: [0,1, 2,3,3]
+      → full: [0,1,1,2,3, 4,5,6,6,7], skip map: 0→9,1→8,2→7,3→6,4→5
+      → tie: [0,1,2,3 4,5,6,6,7], skip map: 0→8,1→7,1→6,2→5,3→4
+      → dec: [0,1,2,3 4,5,6,6,7], skip map: 0→8,1→6,2→5,3→4
     """
     if dup_type not in ("full", "dec", "tie"):
         raise ValueError(f"dup_type must be 'full', 'dec', or 'tie', got '{dup_type}'")
@@ -217,7 +215,7 @@ def _get_skip_weights_src_indices(
             dec_to_enc_idx.append(None)
         else:
             dec_to_enc_idx.append(enc_idx)
-    return [x for x in dec_to_enc_idx if x is not None]
+    return [num_encoder_layers - 1 - x for x in dec_to_enc_idx if x is not None]
 
 
 def inject_optimizer_states_for_dus(
@@ -228,6 +226,9 @@ def inject_optimizer_states_for_dus(
     device: torch.device,
     dup_type: str = "full",
 ) -> None:
+    """
+    The idea is simple, if we duplicate layer/weight x then it should also inherit/clone the states of x.
+    """
     param_to_key: dict[int, tuple] = {}
     for pos in range(len(layer_pattern)):
         for name, p in base_model.blocks[pos].named_parameters():
@@ -273,6 +274,10 @@ def inject_optimizer_states_for_dus(
                                 }
                                 opt.state[p]["exp_avg"] = new_exp_avg
                                 opt.state[p]["exp_avg_sq"] = new_exp_avg_sq
+                                if "step" in saved_state:
+                                    opt.state[p]["step"] = saved_state[
+                                        "step"
+                                    ].to(device=device)
                             else:
                                 opt.state[p] = {
                                     k: v.to(device=device, dtype=p.dtype)
@@ -885,9 +890,6 @@ class GPTWithSOLARDUS(torch.nn.Module):
     1. Symmetric ("full"): encoder pattern is mirrored to decoder
     2. Decoder-only ("dec"): encoder unchanged, only decoder is duplicated
     3. Decoder-only ("tie"): encoder unchanged, only decoder is duplicated, encoder layers are tied meaning single encoder layer can skip to multiple decoders
-
-    Similar approach to eval_enc_dec_duplication.py - uses a wrapper
-    that properly handles skip connections instead of modifying the base model.
     """
 
     def __init__(
@@ -922,7 +924,7 @@ class GPTWithSOLARDUS(torch.nn.Module):
         else:
             self.base_model.skip_weights = nn.Parameter(
                 self.base_model.skip_weights[
-                    torch.tensor([x for x in self.dec_to_enc_idx if x is not None])
+                    torch.tensor([self.num_encoder_layers - 1 - x for x in self.dec_to_enc_idx if x is not None])
                 ]
             )
         self.base_model.blocks = nn.ModuleList(
