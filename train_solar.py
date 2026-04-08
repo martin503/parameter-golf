@@ -137,6 +137,7 @@ def parse_layer_pattern(
     - "full": pattern applies to both encoder and decoder
     - "dec": pattern applies to decoder only, encoder unchanged
     - "tie": pattern applies to decoder only, encoder unchanged
+    - "deconly": encoder completely removed, no skip connections, decoder-only
 
     Examples with n_layers=7 (3 enc + 4 dec), pattern="1,2,3,3,4":
       → full: [0,0,1,2, 3,4,5,5,6], skip map: 0→7,1→6,2→5,3→4
@@ -148,8 +149,8 @@ def parse_layer_pattern(
       → tie: [0,1,2,3 4,5,6,6,7], skip map: 0→8,1→7,1→6,2→5,3→4
       → dec: [0,1,2,3 4,5,6,6,7], skip map: 0→8,1→6,2→5,3→4
     """
-    if dup_type not in ("full", "dec", "tie"):
-        raise ValueError(f"dup_type must be 'full', 'dec', or 'tie', got '{dup_type}'")
+    if dup_type not in ("full", "dec", "tie", "deconly"):
+        raise ValueError(f"dup_type must be 'full', 'dec', 'tie', or 'deconly', got '{dup_type}'")
     indices = [int(i.strip()) for i in pattern.split(",")]
     if any(i < 1 or i > np.ceil(n_layers / 2) for i in indices):
         raise ValueError("Number from pattern not in range")
@@ -163,6 +164,8 @@ def parse_layer_pattern(
         enc_indices = [stop_enc_idx - i - 1 for i in zero_indexed if i < stop_enc_idx][
             ::-1
         ]
+    elif dup_type == "deconly":
+        enc_indices = []
     else:
         enc_indices = [i for i in range(n_layers // 2) if i in zero_indexed]
 
@@ -201,6 +204,8 @@ def _get_skip_weights_src_indices(
     if dup_type == "full":
         dus_enc_count = sum(x < num_encoder_layers for x in layer_pattern)
         return [x for x in layer_pattern[:dus_enc_count] if x is not None]
+    if dup_type == "deconly":
+        return []
     dec_to_enc_idx: list[int | None] = []
     decoder_pattern_relative = [
         x - num_encoder_layers for x in layer_pattern[num_skip_weights:]
@@ -890,6 +895,7 @@ class GPTWithSOLARDUS(torch.nn.Module):
     1. Symmetric ("full"): encoder pattern is mirrored to decoder
     2. Decoder-only ("dec"): encoder unchanged, only decoder is duplicated
     3. Decoder-only ("tie"): encoder unchanged, only decoder is duplicated, encoder layers are tied meaning single encoder layer can skip to multiple decoders
+    4. Decoder-only ("deconly"): encoder completely removed, no skip connections, decoder-only
     """
 
     def __init__(
@@ -906,6 +912,8 @@ class GPTWithSOLARDUS(torch.nn.Module):
         self.num_encoder_layers = (
             sum(x < self.base_model.num_encoder_layers for x in self.layer_pattern)
             if self.dup_type == "full"
+            else 0
+            if self.dup_type == "deconly"
             else self.base_model.num_encoder_layers
         )
         self.dec_to_enc_idx = self._build_enc_mapping()
@@ -921,6 +929,10 @@ class GPTWithSOLARDUS(torch.nn.Module):
                     )
                 ]
             )
+        elif self.dup_type == "deconly":
+            del self.base_model.skip_weights
+            self.base_model.skip_weights = torch.empty(0, self.base_model.tok_emb.weight.shape[1], dtype=torch.float32)
+            self.base_model.num_skip_weights = 0
         else:
             self.base_model.skip_weights = nn.Parameter(
                 self.base_model.skip_weights[
@@ -951,6 +963,9 @@ class GPTWithSOLARDUS(torch.nn.Module):
                     cenc -= 1
                     mapping[i] = cenc
             return mapping
+
+        if self.dup_type == "deconly":
+            return [None] * len(self.layer_pattern)
 
         decoder_pattern_relative = [
             x - self.num_encoder_layers
@@ -1019,7 +1034,7 @@ def apply_dus_model(
         base_model: Original trained model
         pattern: 0-indexed list of layer indices to use
         device: Target device
-        dup_type: Duplication type - "full", "dec", or "tie"
+        dup_type: Duplication type - "full", "dec", "tie", or "deconly"
 
     Returns:
         Wrapped GPT model (GPTWithSOLARDUS wrapper)
