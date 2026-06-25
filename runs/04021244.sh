@@ -1,0 +1,20 @@
+#!/bin/bash
+set +e
+
+MODEL_BASENAME=models/04021244_7l \
+MAX_WALLCLOCK_SECONDS=8000 \
+CHECKPOINT_EVERY_VAL=1 \
+NUM_LAYERS=7 \
+TRAIN_BATCH_TOKENS=720896 \
+WARMDOWN_ITERS=0 \
+SOLAR_ENABLED=0 \
+uv run torchrun --standalone --nproc_per_node=2 train_solar.py
+
+MODEL_BASENAME=models/04021244_8l \
+MAX_WALLCLOCK_SECONDS=5200 \
+CHECKPOINT_EVERY_VAL=1 \
+NUM_LAYERS=8 \
+TRAIN_BATCH_TOKENS=655360 \
+WARMDOWN_ITERS=0 \
+SOLAR_ENABLED=0 \
+uv run torchrun --standalone --nproc_per_node=2 train_solar.py
