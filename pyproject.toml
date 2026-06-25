@@ -1,0 +1,54 @@
+[project]
+name = "parameter-golf"
+version = "0.1.0"
+description = "Beating by diffusion."
+readme = "README.md"
+requires-python = "==3.12.*"
+authors = [
+    { name = "Marcin", email = "m6rcin53@gmail.com" }
+]
+dependencies = [
+    "numpy",
+    "tqdm",
+    "torch",
+    "huggingface-hub",
+    "kernels",
+    "setuptools",
+    "typing-extensions==4.15.0",
+    "datasets",
+    "tiktoken",
+    "sentencepiece",
+    "wandb>=0.25.1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "ty",
+    "pytest",
+    "pre-commit",
+]
+
+[tool.ruff]
+line-length = 150
+target-version = "py312"
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "UP",     # pyupgrade
+]
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
